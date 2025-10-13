@@ -83,6 +83,10 @@ class TSNE(SparseNeighborEmbedding):
         Interval for checking the convergence of the algorithm, by default 50.
     compile : bool, optional
         Whether to compile the algorithm using torch.compile. Default is False.
+    degrees_of_freedom : float, optional
+        Degrees of freedom of the Student's t-distribution used for the
+        low-dimensional affinity :math:`\mathbf{Q}`. Setting ``degrees_of_freedom=1``
+        recovers the original Cauchy-based formulation. Default is 1.0.
     """  # noqa: E501
 
     def __init__(
@@ -111,12 +115,16 @@ class TSNE(SparseNeighborEmbedding):
         sparsity: bool = True,
         check_interval: int = 50,
         compile: bool = False,
+        degrees_of_freedom: float = 1.0,
         **kwargs,
     ):
+        if degrees_of_freedom <= 0:
+            raise ValueError("degrees_of_freedom must be positive.")
         self.metric = metric
         self.perplexity = perplexity
         self.max_iter_affinity = max_iter_affinity
         self.sparsity = sparsity
+        self.degrees_of_freedom = degrees_of_freedom
 
         affinity_in = EntropicAffinity(
             perplexity=perplexity,
@@ -156,12 +164,16 @@ class TSNE(SparseNeighborEmbedding):
             key_indices=self.NN_indices_,
             metric="sqeuclidean",
         )
-        log_Q = -(1 + distances_sq).log()
+        #log_Q = -(1 + distances_sq).log()
+        nu = self.degrees_of_freedom
+        log_Q = -0.5 * (nu + 1.0) * ((distances_sq / nu) + 1).log()
         return cross_entropy_loss(self.affinity_in_, log_Q, log=True)
 
     def _compute_repulsive_loss(self):
         distances_sq = pairwise_distances(
             self.embedding_, metric="sqeuclidean", backend=self.backend
         )
-        log_Q = -(1 + distances_sq).log()
+        #log_Q = -(1 + distances_sq).log()
+        nu = self.degrees_of_freedom
+        log_Q = -0.5 * (nu + 1.0) * ((distances_sq / nu) + 1).log()
         return logsumexp_red(log_Q, dim=(0, 1))

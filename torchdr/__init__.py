@@ -39,15 +39,7 @@ from .eval import silhouette_samples, silhouette_score
 from .neighbor_embedding import (
     SNE,
     TSNE,
-    COSNE,
-    UMAP,
-    InfoTSNE,
-    LargeVis,
-    NeighborEmbedding,
-    SampledNeighborEmbedding,
-    SparseNeighborEmbedding,
-    TSNEkhorn,
-    PACMAP,
+    TNERV
 )
 from .spectral_embedding import (
     IncrementalPCA,
@@ -92,12 +84,7 @@ __all__ = [
     "SampledNeighborEmbedding",
     "SNE",
     "TSNE",
-    "COSNE",
-    "InfoTSNE",
-    "TSNEkhorn",
-    "LargeVis",
-    "UMAP",
-    "PACMAP",
+    "TNERV",
     "pairwise_distances",
     "binary_search",
     "false_position",

@@ -4,14 +4,10 @@
 
 
 from .base import NeighborEmbedding, SampledNeighborEmbedding, SparseNeighborEmbedding
-from .largevis import LargeVis
-from .infotsne import InfoTSNE
 from .sne import SNE
 from .tsne import TSNE
-from .cosne import COSNE
-from .tsnekhorn import TSNEkhorn
-from .umap import UMAP
-from .pacmap import PACMAP
+from .t_nerv import TNERV
+
 
 __all__ = [
     "NeighborEmbedding",
@@ -19,10 +15,5 @@ __all__ = [
     "SampledNeighborEmbedding",
     "SNE",
     "TSNE",
-    "COSNE",
-    "InfoTSNE",
-    "TSNEkhorn",
-    "LargeVis",
-    "UMAP",
-    "PACMAP",
+    "TNERV"
 ]
