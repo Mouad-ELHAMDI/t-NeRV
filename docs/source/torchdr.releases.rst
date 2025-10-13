@@ -1,4 +1,0 @@
-Releases
-========
-
-.. include:: ../../RELEASES.rst
