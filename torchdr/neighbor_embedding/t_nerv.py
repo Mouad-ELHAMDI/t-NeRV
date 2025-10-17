@@ -1,21 +1,54 @@
-"""t-distributed Neighborhood Retrieval Visualizer (t-NeRV)."""
+# t_nerv.py
+"""
+Minimal t-NeRV implementation inspired by TorchDR.
+
+This mirrors TorchDR’s neighbor-embedding style:
+- Sparse input affinity via EntropicAffinity (k-NN with FAISS if requested).
+- Full pairwise terms done with KeOps LazyTensors when backend="keops" (no NxN allocation).
+- No manual chunking: we rely on LazyTensor algebra + TorchDR reducers.
+
+Loss = lambda * KL(P || Q) + (1-lambda) * KL(Q || P)
+See docstring in the user prompt for details.
+"""
+
+from __future__ import annotations
 
 from typing import Dict, Optional, Union, Type
 
 import torch
 
 from torchdr.affinity import EntropicAffinity
-from torchdr.distance import FaissConfig, pairwise_distances
+from torchdr.distance import (
+    FaissConfig,
+    pairwise_distances,
+    pairwise_distances_indexed,
+)
 from torchdr.neighbor_embedding.base import SparseNeighborEmbedding
-from torchdr.utils import cross_entropy_loss, logsumexp_red
+from torchdr.utils import (
+    cross_entropy_loss,
+    logsumexp_red,
+    sum_red,
+    identity_matrix,
+)
+
+try:
+    # Optional import; we only use this to *detect* LazyTensor objects
+    from pykeops.torch import LazyTensor as _LazyTensor  # type: ignore
+except Exception:  # pragma: no cover
+    _LazyTensor = ()  # sentinel for isinstance checks
+
+
+def _is_lazy(x) -> bool:
+    """Return True if x is a KeOps LazyTensor."""
+    return bool(_LazyTensor) and isinstance(x, _LazyTensor)
 
 
 class TNERV(SparseNeighborEmbedding):
-    r"""t-NeRV embedding introduced in :cite:`venna2010neighbor`."""
+    r"""t-distributed Neighborhood Retrieval Visualizer (Venna et al., 2010)."""
 
     def __init__(
         self,
-        perplexity: float = 30,
+        perplexity: float = 30.0,
         n_components: int = 2,
         lr: Union[float, str] = "auto",
         optimizer: Union[str, Type[torch.optim.Optimizer]] = "SGD",
@@ -37,35 +70,40 @@ class TNERV(SparseNeighborEmbedding):
         max_iter_affinity: int = 100,
         metric: str = "sqeuclidean",
         sparsity: bool = True,
+        lambda_param: float = 0.5,
+        degrees_of_freedom: float = 1.0,
+        p_smoothing: float = 1e-12,
         check_interval: int = 50,
         compile: bool = False,
-        degrees_of_freedom: float = 1.0,
-        lambda_param: float = 0.5,
-        **kwargs,
-    ):
+        **kwargs: Dict,
+    ) -> None:
+        if not 0.0 <= lambda_param <= 1.0:
+            raise ValueError("lambda_param must lie in [0, 1].")
         if degrees_of_freedom <= 0:
             raise ValueError("degrees_of_freedom must be positive.")
-        if not 0.0 <= lambda_param <= 1.0:
-            raise ValueError("lambda_param must lie in the interval [0, 1].")
 
         self.metric = metric
         self.perplexity = perplexity
         self.max_iter_affinity = max_iter_affinity
-        self.sparsity = sparsity
-        self.degrees_of_freedom = degrees_of_freedom
-        self.lambda_param = lambda_param
-        self._use_direct_gradients = True
-        self._p_smoothing = 1e-12
+        self.sparsity = bool(sparsity)
+        self.degrees_of_freedom = float(degrees_of_freedom)
+        self.lambda_param = float(lambda_param)
+        self._p_smoothing = float(p_smoothing)
 
+        # Rely on autograd for gradients:
+        self._use_direct_gradients = False
+
+        # Input affinity: FAISS/KeOps selection flows through `backend`.
         affinity_in = EntropicAffinity(
             perplexity=perplexity,
             metric=metric,
             max_iter=max_iter_affinity,
             device=device,
-            backend=backend,
+            backend=backend,   # FAISS for k-NN if FaissConfig or "faiss"; KeOps if "keops"
             verbose=verbose,
             sparsity=sparsity,
         )
+
         super().__init__(
             affinity_in=affinity_in,
             n_components=n_components,
@@ -89,136 +127,96 @@ class TNERV(SparseNeighborEmbedding):
             **kwargs,
         )
 
-    @torch.no_grad()
-    def _build_dense_affinity(self, device: torch.device, dtype: torch.dtype):
-        n = self.n_samples_in_
-
-        if hasattr(self, "NN_indices_"):
-            values = self.affinity_in_.to(device=device, dtype=dtype)
-            indices = self.NN_indices_.to(device)
-            dense = torch.full(
-                (n, n), self._p_smoothing, device=device, dtype=dtype
-            )
-            dense.scatter_(1, indices, values)
-        else:
-            dense = self.affinity_in_.to(device=device, dtype=dtype).clone()
-            dense = dense.clamp_min(self._p_smoothing)
-
-        diag_idx = torch.arange(n, device=device)
-        dense[diag_idx, diag_idx] = self._p_smoothing
-        total_mass = dense.sum()
-        if total_mass <= 0:
-            raise ValueError("Dense affinity must have positive total mass.")
-        dense /= total_mass
-        log_dense = dense.clamp_min(self._p_smoothing).log()
-
-        self._affinity_dense_cache = dense
-        self._log_affinity_dense_cache = log_dense
-
-    def _get_dense_affinity(self, device: torch.device, dtype: torch.dtype):
-        cache = getattr(self, "_affinity_dense_cache", None)
-        if (
-            cache is None
-            or cache.device != device
-            or cache.dtype != dtype
-        ):
-            self._build_dense_affinity(device, dtype)
-        return self._affinity_dense_cache, self._log_affinity_dense_cache
-
-    @torch.no_grad()
-    def _compute_common_terms(self):
+    # ------------------------------------------------------------------ #
+    #                            t-NeRV loss                             #
+    # ------------------------------------------------------------------ #
+    def _compute_loss(self) -> torch.Tensor:
         device = self.embedding_.device
         dtype = self.embedding_.dtype
-        P_dense, log_P_dense = self._get_dense_affinity(device, dtype)
+        n = self.n_samples_in_
+        nu = torch.as_tensor(self.degrees_of_freedom, device=device, dtype=dtype)
 
-        distances_sq = pairwise_distances(
+        # ---------- Attractive term: neighbors only (dense [n,k]) ----------
+        D2_nn = pairwise_distances_indexed(
+            self.embedding_,
+            key_indices=self.NN_indices_,   # [n, k]
+            metric="sqeuclidean",
+            backend=self.backend,
+        )
+        if _is_lazy(D2_nn):
+            # (rare; typically returns Tensor)
+            logW_nn = (-0.5 * (nu + 1.0)) * (1 + D2_nn / nu).log()
+            # Materialize small (n,k) for CE if needed:
+            D2_nn_t = (D2_nn).torch()  # LazyTensor -> torch.Tensor
+            logW_nn = (-0.5 * (nu + 1.0)) * torch.log1p(D2_nn_t / nu)
+        else:
+            logW_nn = (-0.5 * (nu + 1.0)) * torch.log1p(D2_nn / nu)
+
+        # CE over neighbors, unnormalized by Z
+        ce_loss = cross_entropy_loss(self.affinity_in_, logW_nn, log=True)
+
+        # ---------- Repulsive + reverse-KL terms: all pairs ----------
+        D2_full = pairwise_distances(
             self.embedding_, metric="sqeuclidean", backend=self.backend
         )
-        nu = self.degrees_of_freedom
-        log_w_full = -0.5 * (nu + 1.0) * torch.log1p(distances_sq / nu)
-        diag_idx = torch.arange(distances_sq.shape[0], device=device)
-        log_w_full[diag_idx, diag_idx] = float("-inf")
 
-        logZ = logsumexp_red(log_w_full, dim=(0, 1))
-        log_q_full = log_w_full - logZ
-        q_full = torch.exp(log_q_full)
-        q_full[diag_idx, diag_idx] = 0.0
-        log_q_safe = torch.where(q_full > 0, log_q_full, torch.zeros_like(log_q_full))
+        if _is_lazy(D2_full):
+            # KeOps path: use LazyTensor-friendly ops
+            logW_full = (-0.5 * (nu + 1.0)) * (1 + D2_full / nu).log()
 
-        student_factor = nu / (nu + distances_sq)
-        student_factor[diag_idx, diag_idx] = 0.0
+            # Mask diagonal without indexing: add a large negative on identity
+            logW_full = logW_full + identity_matrix(
+                n, keops=True, device=device, dtype=dtype
+            ) * (-1e6)
 
-        if hasattr(self, "NN_indices_"):
-            log_w_neighbors = log_w_full.gather(
-                1, self.NN_indices_.to(device)
-            )
+            # Partition function and log Q
+            logZ = logsumexp_red(logW_full, dim=(0, 1))
+            logQ_full = logW_full - logZ
+            Q_full = logQ_full.exp()
+
+            # Entropy of Q: sum(Q log Q)
+            q_log_q_sum = sum_red(Q_full * logQ_full, dim=(0, 1))
+
         else:
-            log_w_neighbors = log_w_full
+            # Dense PyTorch path (small N)
+            logW_full = (-0.5 * (nu + 1.0)) * torch.log1p(D2_full / nu)
+            diag = torch.arange(n, device=device)
+            logW_full[diag, diag] = float("-inf")
+            logZ = torch.logsumexp(logW_full.reshape(-1), dim=0)
+            logQ_full = logW_full - logZ
+            Q_full = logQ_full.exp()
+            q_log_q_sum = (Q_full * logQ_full).sum()
 
-        log_ratio = log_q_safe - log_P_dense
-        avg_log_ratio = (q_full * log_ratio).sum()
+        # Attractive part: lambda * (EE * CE + logZ + H(P))
+        attractive = self.lambda_param * (self.early_exaggeration_coeff_ * ce_loss + logZ)
 
-        p_log_p = (P_dense * log_P_dense).sum()
+        # ---------- H(P): entropy of input affinity without dense P ----------
+        values = self.affinity_in_.to(device=device, dtype=dtype)  # [n, k]
+        smoothing = torch.as_tensor(self._p_smoothing, device=device, dtype=dtype)
+        total_entries = n * n
+        num_neighbors = values.numel()
+        total_mass = total_entries * smoothing - num_neighbors * smoothing + values.sum()
+        p_base = smoothing / total_mass
+        log_p_base = torch.log(p_base)
+        p_neighbors = values / total_mass
+        log_p_neighbors = torch.log(p_neighbors.clamp_min(torch.finfo(dtype).tiny))
+        p_log_p = (p_neighbors * log_p_neighbors).sum() + (total_entries - num_neighbors) * p_base * log_p_base
 
-        return {
-            "P_dense": P_dense,
-            "log_P_dense": log_P_dense,
-            "log_w_neighbors": log_w_neighbors,
-            "logZ": logZ,
-            "q_full": q_full,
-            "log_ratio": log_ratio,
-            "avg_log_ratio": avg_log_ratio,
-            "student_factor": student_factor,
-            "p_log_p": p_log_p,
-        }
+        attractive = attractive + self.lambda_param * p_log_p
 
-    def _compute_loss(self):
-        with torch.no_grad():
-            terms = self._compute_common_terms()
-            ce_term = cross_entropy_loss(
-                self.affinity_in_.to(
-                    device=self.embedding_.device, dtype=self.embedding_.dtype
-                ),
-                terms["log_w_neighbors"],
-                log=True,
-            )
-            loss = (
-                self.lambda_param
-                * (
-                    self.early_exaggeration_coeff_ * ce_term
-                    + terms["logZ"]
-                    + terms["p_log_p"]
-                )
-                + (1.0 - self.lambda_param) * terms["avg_log_ratio"]
-            )
+        # ---------- Reverse KL: KL(Q || P) = sum Q log(Q/P) ----------
+        # Neighbor contributions of Q log P:
+        # logQ_nn is dense [n,k] since logW_nn is dense [n,k]
+        logQ_nn = logW_nn - logZ
+        q_nn = logQ_nn.exp()
+        q_nn_sum = q_nn.sum()
+        S2 = (q_nn * log_p_neighbors).sum()
+
+        # Non-neighbor contributions: remaining probability mass times log p_base
+        S3 = (1.0 - q_nn_sum) * log_p_base
+
+        reverse_kl = q_log_q_sum - S2 - S3
+
+        # ---------- Final loss ----------
+        loss = attractive + (1.0 - self.lambda_param) * reverse_kl
         return loss
-
-    @torch.no_grad()
-    def _compute_gradients(self):
-        terms = self._compute_common_terms()
-        q_full = terms["q_full"]
-        log_ratio = terms["log_ratio"]
-        avg_log_ratio = terms["avg_log_ratio"]
-        student_factor = terms["student_factor"]
-        P_dense = terms["P_dense"]
-
-        nu = self.degrees_of_freedom
-        prefactor = 2.0 * (nu + 1.0) / nu
-        diff = self.embedding_.unsqueeze(1) - self.embedding_.unsqueeze(0)
-
-        weighted = (
-            self.lambda_param
-            * (self.early_exaggeration_coeff_ * P_dense - q_full)
-            + (1.0 - self.lambda_param)
-            * q_full
-            * (log_ratio - avg_log_ratio)
-        )
-        forces = weighted * student_factor
-        gradients = prefactor * (forces.unsqueeze(-1) * diff).sum(dim=1)
-        return gradients
-
-    def clear_memory(self):
-        for attr in ("_affinity_dense_cache", "_log_affinity_dense_cache"):
-            if hasattr(self, attr):
-                delattr(self, attr)
-        return super().clear_memory()
