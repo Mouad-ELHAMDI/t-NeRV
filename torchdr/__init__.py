@@ -39,6 +39,7 @@ from .eval import silhouette_samples, silhouette_score
 from .neighbor_embedding import (
     SNE,
     TSNE,
+    NERV,
     TNERV
 )
 from .spectral_embedding import (
@@ -84,6 +85,7 @@ __all__ = [
     "SampledNeighborEmbedding",
     "SNE",
     "TSNE",
+    "NERV",
     "TNERV",
     "pairwise_distances",
     "binary_search",

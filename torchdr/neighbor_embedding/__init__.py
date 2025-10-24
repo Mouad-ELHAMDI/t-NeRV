@@ -6,6 +6,7 @@
 from .base import NeighborEmbedding, SampledNeighborEmbedding, SparseNeighborEmbedding
 from .sne import SNE
 from .tsne import TSNE
+from .nerv import NERV
 from .t_nerv import TNERV
 
 
@@ -15,5 +16,6 @@ __all__ = [
     "SampledNeighborEmbedding",
     "SNE",
     "TSNE",
+    "NERV",
     "TNERV"
 ]
