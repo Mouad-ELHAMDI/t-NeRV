@@ -1,6 +1,5 @@
-# t_nerv.py
 """
-Minimal t-NeRV implementation inspired by TorchDR.
+t-NeRV implementation inspired by TorchDR.
 
 This mirrors TorchDR’s neighbor-embedding style:
 - Sparse input affinity via EntropicAffinity (k-NN with FAISS if requested).

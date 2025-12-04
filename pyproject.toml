@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "t-nerv"
+version = "0.1.0"
+description = "neighbor embedding Heavy-Tailed Neighbor Retrieval Visualizer built on torchdr"
+readme = "README.md"
+authors = [{ name = "Hugues Van Assel" }, { name = "Contributors" }]
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+classifiers = [
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "scikit-learn>=1.3",
+    "matplotlib>=3.7",
+    "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+keops = ["pykeops>=2.2"]
+faiss = ["faiss-gpu>=1.7; platform_system == 'Linux'", "faiss-cpu>=1.7; platform_system != 'Linux'"]
+dev = ["black>=23.0", "ruff>=0.2", "pytest>=7.4", "mypy>=1.8"]
+
+[tool.setuptools]
+packages = [
+    "torchdr",
+    "torchdr.affinity",
+    "torchdr.distance",
+    "torchdr.eval",
+    "torchdr.neighbor_embedding",
+    "torchdr.spectral_embedding",
+    "torchdr.utils",
+]
+include-package-data = true
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "B", "UP", "NPY", "ASYNC", "PT", "PL"]
+ignore = ["E203", "E501"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true

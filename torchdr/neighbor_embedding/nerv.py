@@ -1,6 +1,5 @@
-# nerv.py
 """
-Minimal NeRV implementation inspired by the t-NeRV module.
+NeRV implementation inspired by the t-NeRV module.
 
 The implementation mirrors the structure of :mod:`torchdr.neighbor_embedding.t_nerv`
 but swaps the low-dimensional probability model for the original Gaussian kernel
